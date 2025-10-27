@@ -13,6 +13,7 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#include "circleBoxTest.cu_inl"
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -506,12 +507,19 @@ __global__ void kernelRenderPixels() {
 
     float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f), invHeight * (static_cast<float>(pixelY) + 0.5f));
+    float4 pixelColor = *imgPtr;
 
     for (int circleIndex = 0; circleIndex < cuConstRendererParams.numCircles; circleIndex++) {
         int index3 = 3 * circleIndex;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        pixel_parallel_shade(circleIndex, pixelCenterNorm, p, imgPtr);
+        // float rad = cuConstRendererParams.radius[circleIndex];
+        // if (pixelCenterNorm.x < p.x-rad || pixelCenterNorm.x > p.x+rad ||
+        //     pixelCenterNorm.y < p.y-rad || pixelCenterNorm.y > p.y+rad) {
+        //     continue;
+        // }
+        pixel_parallel_shade(circleIndex, pixelCenterNorm, p, &pixelColor);
     }
+    *imgPtr = pixelColor;
 
 }
 
