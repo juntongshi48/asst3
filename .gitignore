@@ -1,5 +1,10 @@
 **.o
+**.ppm
+
 saxpy/cudaSaxpy
 
 scan/logs
 scan/cudaScan
+
+render/logs
+render/render
