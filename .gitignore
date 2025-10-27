@@ -1,2 +1,5 @@
 **.o
 saxpy/cudaSaxpy
+
+scan/logs
+scan/cudaScan

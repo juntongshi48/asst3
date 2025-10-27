@@ -10,9 +10,12 @@
 #include <thrust/device_malloc.h>
 #include <thrust/device_free.h>
 
+#include <cstring>
+
 #include "CycleTimer.h"
 
 #define THREADS_PER_BLOCK 256
+#define MAX_BLOCKS 65535
 
 
 // helper function to round an integer up to the next power of 2
@@ -25,6 +28,66 @@ static inline int nextPow2(int n) {
     n |= n >> 16;
     n++;
     return n;
+}
+
+__global__ void
+upsweep_kernel(int* output, int two_d, int N) {
+    int two_dp1 = two_d*2;
+    int num_tasks = N / (two_d * 2);
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    for (; index < num_tasks; index += blockDim.x * gridDim.x) {
+        long i = index*two_dp1;
+        long right = i+two_dp1-1;
+        long left = i+two_d-1;
+        if (right < N) {
+            output[right] += output[left];
+        }
+    }
+}
+
+__global__ void
+downsweep_kernel(int* output, int two_d, int N) {
+    int two_dp1 = two_d*2;
+    int num_tasks = N / (two_d * 2);
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    for (; index < num_tasks; index += blockDim.x * gridDim.x) {
+        long i = index*two_dp1;
+        long right = i+two_dp1-1;
+        long left = i+two_d-1;
+        if (right < N) {
+            int t = output[left];
+            output[left] = output[right];
+            output[right] += t;
+        }
+    }
+}
+
+__global__ void
+create_mask_kernel(int* input, int* mask, int length) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    for (; index < length; index += blockDim.x * gridDim.x) {
+        if (index == length-1) {
+            mask[index] = 0;
+            return;
+        }
+
+        if (input[index+1] == input[index]) {
+            mask[index] = 1;
+        }
+        else {
+            mask[index] = 0;
+        }
+    }
+}
+
+__global__ void
+fill_output_kernel(int* output, int* mask, int* idx_in_output, int length) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    for (; index < length; index += blockDim.x * gridDim.x) {
+        if (mask[index]==1) {
+            output[idx_in_output[index]] = index;
+        }
+    }
 }
 
 // exclusive_scan --
@@ -53,7 +116,36 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    int padded_N = nextPow2(N);
+    cudaMemcpy(result, input, N * sizeof(int), cudaMemcpyDeviceToDevice);
 
+    // upsweep phase
+    for (int two_d=1; two_d <= padded_N/2; two_d*=2) {
+        int two_dp1 = 2*two_d;
+        int num_tasks = padded_N/two_dp1;
+        int blocks = (num_tasks+THREADS_PER_BLOCK-1) / THREADS_PER_BLOCK;
+        if (blocks > MAX_BLOCKS) {
+            blocks = MAX_BLOCKS;
+        }
+        upsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, padded_N);
+        CUDA_CHECK_LAUNCH();
+        cudaDeviceSynchronize(); // need to wait for the current iteration to finish
+    }
+    
+    int zero = 0;
+    cudaMemcpy(result+padded_N-1, &zero, sizeof(int), cudaMemcpyHostToDevice);
+
+    for (int two_d=padded_N/2; two_d >= 1; two_d/=2) {
+        int two_dp1 = 2*two_d;
+        int num_tasks = padded_N/two_dp1;
+        int blocks = (num_tasks+THREADS_PER_BLOCK-1) / THREADS_PER_BLOCK;
+        if (blocks > MAX_BLOCKS) {
+            blocks = MAX_BLOCKS;
+        }
+        downsweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(result, two_d, padded_N);
+        CUDA_CHECK_LAUNCH();
+        cudaDeviceSynchronize();
+    }
 
 }
 
@@ -161,7 +253,26 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
 
-    return 0; 
+    int* mask;
+    int padded_length = nextPow2(length);
+    cudaMalloc((void **)&mask, sizeof(int) * padded_length);
+
+    int blocks = (padded_length+THREADS_PER_BLOCK-1)/THREADS_PER_BLOCK;
+    if (blocks > MAX_BLOCKS) {
+        blocks = MAX_BLOCKS;
+    }
+    create_mask_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_input, mask, padded_length);
+
+    int* idx_in_output;
+    cudaMalloc((void **) &idx_in_output, sizeof(int) * (padded_length));
+    exclusive_scan(mask, length, idx_in_output);
+
+    fill_output_kernel<<<blocks, THREADS_PER_BLOCK>>>(device_output, mask, idx_in_output, length);
+
+    int total_repeats;
+    cudaMemcpy(&total_repeats, idx_in_output + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+    
+    return total_repeats; 
 }
 
 
