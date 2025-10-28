@@ -15,6 +15,10 @@
 #include "util.h"
 #include "circleBoxTest.cu_inl"
 
+#define TILE_SIZE 16
+#define SCAN_BLOCK_DIM 256  // need to be the square of TILE_SIZE
+#include "exclusiveScan.cu_inl"
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -495,13 +499,11 @@ __global__ void kernelRenderPixels() {
     int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
     int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
 
+    int linear_tid = threadIdx.x + threadIdx.y * blockDim.x;
+
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
-
-    if (pixelX >= imageWidth || pixelY >= imageHeight) {
-        return;
-    }
-
+    bool inBounds = pixelX < imageWidth && pixelY < imageHeight;
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
 
@@ -509,15 +511,52 @@ __global__ void kernelRenderPixels() {
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f), invHeight * (static_cast<float>(pixelY) + 0.5f));
     float4 pixelColor = *imgPtr;
 
-    for (int circleIndex = 0; circleIndex < cuConstRendererParams.numCircles; circleIndex++) {
-        int index3 = 3 * circleIndex;
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        // float rad = cuConstRendererParams.radius[circleIndex];
-        // if (pixelCenterNorm.x < p.x-rad || pixelCenterNorm.x > p.x+rad ||
-        //     pixelCenterNorm.y < p.y-rad || pixelCenterNorm.y > p.y+rad) {
-        //     continue;
-        // }
-        pixel_parallel_shade(circleIndex, pixelCenterNorm, p, &pixelColor);
+    float4 tile = make_float4(
+        invWidth * (static_cast<float>(blockIdx.x * blockDim.x)),
+        invWidth * (static_cast<float>((blockIdx.x+1) * blockDim.x)),
+        invHeight * (static_cast<float>((blockIdx.y+1) * blockDim.y)),
+        invHeight * (static_cast<float>(blockIdx.y * blockDim.y))
+    );
+
+    int numCircles = cuConstRendererParams.numCircles;
+    __shared__ uint isIntersecting[SCAN_BLOCK_DIM];
+    __shared__ uint offsets[SCAN_BLOCK_DIM];
+    __shared__ uint scratch[2 * SCAN_BLOCK_DIM];
+    __shared__ int numIntersecting;
+    __shared__ int circleIndices[SCAN_BLOCK_DIM];
+
+    for (int c_idx_base=0; c_idx_base<numCircles; c_idx_base+=SCAN_BLOCK_DIM) {
+        int cIdx = c_idx_base + linear_tid;
+        uint intersect = 0;
+        if (cIdx < numCircles){
+            float3 p = *(float3*)(&cuConstRendererParams.position[3 * cIdx]);
+            float r = cuConstRendererParams.radius[cIdx];
+            intersect = circleInBoxConservative(
+                p.x, p.y, r,
+                tile.x, tile.y, tile.z, tile.w
+            );
+        }
+        isIntersecting[linear_tid] = intersect;
+        __syncthreads();
+        sharedMemExclusiveScan(linear_tid, isIntersecting, offsets, scratch, SCAN_BLOCK_DIM);
+        __syncthreads();
+        if (linear_tid == SCAN_BLOCK_DIM - 1) { // only one thread needs to write the total count. We use the last thread because it is not counted in the exclusive scan
+            numIntersecting = offsets[SCAN_BLOCK_DIM - 1] + isIntersecting[SCAN_BLOCK_DIM - 1];
+        }
+        __syncthreads();
+        if (intersect) {
+            circleIndices[offsets[linear_tid]] = cIdx;
+        }
+        __syncthreads();
+        if (inBounds) {
+            for (int i = 0; i < numIntersecting; i++) {
+                int circleIndex = circleIndices[i];
+                int index3 = 3 * circleIndex;
+                float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+                pixel_parallel_shade(circleIndex, pixelCenterNorm, p, &pixelColor);
+            }
+        }
+        __syncthreads();
     }
     *imgPtr = pixelColor;
 
@@ -739,7 +778,7 @@ CudaRenderer::render() {
     // kernelRenderCircles<<<gridDim, blockDim>>>();
 
 
-    dim3 blockDim(16, 16); // 2d blocks of pixels
+    dim3 blockDim(TILE_SIZE, TILE_SIZE); // 2d blocks of pixels
     dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x, 
                  (image->height + blockDim.y - 1) / blockDim.y);
 
